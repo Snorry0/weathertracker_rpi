@@ -15,6 +15,18 @@ ZWJ = "\u200d"               # Zero Width Joiner
 def strip_variants(s: str) -> str:
     # rimuove selettori/zwj che a volte rompono il rendering in curses
     return s.replace(ZWJ, "").replace(EMOJI_VARIATION, "")
+def bw_symbol_for_code(code: int | None) -> str: #todo: sistemarlo per bypassare questo o trovare un modo per far funzionare curses in ssh
+    if code is None: return ""
+    c = int(code)
+    if c in (0,):                      return "☀"   # sereno
+    if c in (1, 2):                    return "⛅"   # poco/parz. nuv.
+    if c in (3,):                      return "☁"   # coperto
+    if c in (45, 48):                  return "≋"   # nebbia (appross.)
+    if c in (51, 53, 55, 56, 57):      return "☔"   # pioviggine/gelata
+    if c in (61, 63, 65, 66, 67, 80, 81, 82): return "☔"   # pioggia/rovesci
+    if c in (71, 73, 75, 77, 85, 86):  return "❄"   # neve
+    if c in (95, 96, 99):              return "⚡"   # temporale
+    return ""
 # riuso funzioni dal modulo CLI
 from .cli import ip_location, geocode_city, fetch_weather, describe_code
 
@@ -58,9 +70,9 @@ def describe_for_tui(code: int | None, mode: str) -> str:
     if mode == "off":
         return parts[1] if len(parts) > 1 else txt
     # bw: tieni il simbolo ma senza varianti, così molti terminali lo rendono in b/n
-    if len(parts) > 1:
-        return strip_variants(parts[0]) + " " + parts[1]
-    return strip_variants(txt)
+    sym = bw_symbol_for_code(code)
+    label = parts[1] if len(parts) > 1 else txt
+    return (strip_variants(sym) + " " + label).strip()
 # ---------------------- colori curses ----------------------
 def init_colors():
     """Inizializza coppie di colori per linee e riempimenti."""
@@ -82,7 +94,7 @@ FILL_TEMP, FILL_PREC, FILL_HUM = 11, 12, 13
 
 # ---------------------- stato app ----------------------
 @dataclass
-class AppState:
+class AppState: #I default del sistema all'avvio dell'applicazione
     emoji_mode: str = "bw"       # "off" | "bw" | "color"
     layout: str = "bottom"       # "bottom" | "side"
     city_query: Optional[str] = None
@@ -97,6 +109,9 @@ class AppState:
     use_emoji: bool = True
     spark_charset: str = "blocks"
     graph_mode: str = "temp_prec"  # "temp_prec" | "prec_hum"
+    emoji_mode: str = "bw"        # "off" | "bw" | "color"
+    layout: str = "bottom"        # "bottom" | "side"
+
 
     def clamp_hours(self) -> None:
         self.hours = max(6, min(168, self.hours))
@@ -108,21 +123,33 @@ def prompt_input_line(stdscr, prompt: str) -> Optional[str]:
     stdscr.move(y, 0); stdscr.clrtoeol()
     msg = f"{prompt}: "
     stdscr.addstr(y, 0, msg); stdscr.refresh()
-    buf: List[str] = []; x = len(msg); curses.curs_set(1)
-    while True:
-        ch = stdscr.get_wch()
-        if isinstance(ch, str) and ch == "\n":
-            curses.curs_set(0); return "".join(buf)
-        if ch == 27:  # ESC
-            curses.curs_set(0); return None
-        if ch in ("\b", "\x7f", curses.KEY_BACKSPACE):
-            if buf:
-                buf.pop(); x -= 1
-                stdscr.move(y, x); stdscr.delch()
-        elif isinstance(ch, str) and ch.isprintable():
-            if x < max_x - 1:
-                buf.append(ch); stdscr.addstr(y, x, ch); x += 1
-        stdscr.refresh()
+
+    buf: List[str] = []; x = len(msg)
+    # salva stato e passa a input bloccante
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)  # attesa infinita
+
+    try: #per risolvere il crash dell'esc
+        while True:
+            ch = stdscr.get_wch()
+            if isinstance(ch, str) and ch == "\n":
+                return "".join(buf)
+            if ch == 27:  # ESC
+                return None
+            if ch in ("\b", "\x7f", curses.KEY_BACKSPACE):
+                if buf:
+                    buf.pop(); x -= 1
+                    stdscr.move(y, x); stdscr.delch()
+            elif isinstance(ch, str) and ch.isprintable():
+                if x < max_x - 1:
+                    buf.append(ch); stdscr.addstr(y, x, ch); x += 1
+            stdscr.refresh()
+    finally:
+        # ripristina modalità non bloccante del loop principale
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(0)  # il loop reimposterà refresh_sec ad ogni iterazione
 
 # ---------------------- fetch dati ----------------------
 def ensure_data(state: AppState) -> None:
@@ -148,7 +175,7 @@ def draw_header(stdscr, state: AppState) -> int:
     max_y, max_x = stdscr.getmaxyx()
     line = f" meteocli-tui  ·  {state.city_label}  ·  {time.strftime('%Y-%m-%d %H:%M:%S')} "
     stdscr.addstr(0, 0, line[:max_x].ljust(max_x), curses.A_REVERSE)
-    help_line = "[q] quit  [c] città  [g] geo-IP  [u] C/F  [w] vento  [+/-] ore  [t] grafici  [r] refresh  [?] help"
+    help_line = "[q] quit  [c] città  [g] geo-IP  [u] C/F  [w] vento  [+/-] ore  [t] grafici  [r] refresh  [?] help  [e] Emoji  [o]pos_graph"
     stdscr.addstr(1, 0, help_line[:max_x].ljust(max_x))
     status = f"emoji:{state.emoji_mode}  graph:{state.graph_mode}  layout:{state.layout}  hours:{state.hours}  wind:{state.wind_unit}"
     stdscr.addstr(2, 0, status[:max_x].ljust(max_x))
@@ -177,7 +204,7 @@ def draw_current_panel(stdscr, y0: int, x0: int, w: int, state: AppState) -> int
         ("Pressione",    f"{int(pr)} hPa" if pr is not None else "—"),
     ]
     for k, v in rows:
-        stdscr.addstr(y, x0, f"{k:<15} {v}"[:w]); y += 1
+        stdscr.addstr(y, x0, f"{k:<15} {v}".ljust(w)[:w]); y += 1
     return y
 
 def draw_forecast_table(stdscr, y0: int, x0: int, w: int, state: AppState) -> int:
@@ -189,13 +216,14 @@ def draw_forecast_table(stdscr, y0: int, x0: int, w: int, state: AppState) -> in
     probs = H.get("precipitation_probability", [])[:state.hours]
     codes = H.get("weather_code", [])[:state.hours]
     unit_t = "°C" if state.temp_unit == "c" else "°F"
-    stdscr.addstr(y, x0, "Ora   Temp   Prec%   Meteo"[:w]); y += 1
+    stdscr.addstr(y, x0, "Ora   Temp   Prec%   Meteo".ljust(w)[:w]); y += 1
     for i in range(0, min(len(times), 12), 3):
         tstr = safe_get(times, i, "—")
         tval = safe_get(temps, i); pval = safe_get(probs, i); code = safe_get(codes, i)
         ora = tstr[11:16] if isinstance(tstr, str) and len(tstr) >= 16 else "—"
         line = f"{ora:<5} {(f'{tval:.0f}{unit_t}' if tval is not None else '—'):<6} {(f'{int(pval)}%' if pval is not None else '—'):<6} {describe_for_tui(code, state.emoji_mode)}"
-        stdscr.addstr(y, x0, line[:w]); y += 1
+        stdscr.addstr(y, x0, line.ljust(w)[:w]); 
+        y += 1
     return y
 
 # ---------------------- grafici area colorati ----------------------
