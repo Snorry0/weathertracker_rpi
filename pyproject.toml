@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "meteocli"
-version = "0.1.0"
+version = "0.2.2"
 description = "CLI meteo per terminale (Raspberry/SSH) con grafici ASCII"
 readme = "README.md"
 authors = [{name = "Snorry0"}]
@@ -14,13 +14,17 @@ requires-python = ">=3.9"
 dependencies = [
 "requests>=2.31",
 "rich>=13",
-"plotext>=5",
+"plotext>=5.3,<6",
 "typer>=0.12.5",
+# per chi lo esegue su Windows non da SSH ha bisogno di curses
+"windows-curses; platform_system == 'Windows'",
 ]
 
 
 [project.scripts]
 meteo = "meteocli.cli:main"
+meteo-top = "meteocli.top:main"
+meteo-tui = "meteocli.tui:main" 
 
 
 [tool.hatch.build.targets.wheel]

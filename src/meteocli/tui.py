@@ -1,45 +1,20 @@
 from __future__ import annotations
 """
-TUI interattiva "alla htop" con GRAFICI completi (plotext)
+TUI interattiva "alla htop" con GRAFICI colore (curses)
 - Fullscreen curses (q/ESC per uscire)
 - Auto-refresh schermo e refetch dati separati
-- Grafici ASCII via plotext (catturo l'output di plt.show() e lo disegno a destra)
-- Fallback automatico a sparkline se lo spazio non basta
+- Due grafici 'area' colorati nel pannello destro (temperatura + precipitazioni / umidità)
+- Fallback a sparkline se lo spazio è troppo ridotto
 """
 
-import curses, time, textwrap, io, contextlib
+import curses, time, textwrap
 from dataclasses import dataclass
 from typing import List, Optional
 
 # riuso funzioni dal modulo CLI
 from .cli import ip_location, geocode_city, fetch_weather, describe_code
-# --- colori curses ------------------------------------------------------------
-def init_colors():
-    """Inizializza coppie di colori per linee e riempimenti."""
-    if not curses.has_colors():
-        return
-    curses.start_color()
-    curses.use_default_colors()
 
-    # linee (foreground)
-    curses.init_pair(1, curses.COLOR_YELLOW, -1)  # temperatura
-    curses.init_pair(2, curses.COLOR_BLUE,   -1)  # precipitazioni
-    curses.init_pair(3, curses.COLOR_CYAN,   -1)  # umidità
-
-    # riempimenti (background)
-    curses.init_pair(11, -1, curses.COLOR_YELLOW)
-    curses.init_pair(12, -1, curses.COLOR_BLUE)
-    curses.init_pair(13, -1, curses.COLOR_CYAN)
-
-LINE_TEMP  = 1
-LINE_PREC  = 2
-LINE_HUM   = 3
-FILL_TEMP  = 11
-FILL_PREC  = 12
-FILL_HUM   = 13
-# --------------------------------------------------------
-# utilità base: sparkline + helper per testo / dati
-# --------------------------------------------------------
+# ---------------------- utilità base ----------------------
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 SPARK_ASCII  = " .:-=+*#%@"
 
@@ -62,7 +37,7 @@ def sparkline(values: List[float], width: int = 40, charset: str = "blocks") -> 
         out.append(blocks[idx])
     return "".join(out)
 
-def clean_floats(seq):  # elimina None e converte
+def clean_floats(seq):
     return [float(v) for v in seq if v is not None]
 
 def describe_for_tui(code: int | None, use_emoji: bool) -> str:
@@ -71,9 +46,26 @@ def describe_for_tui(code: int | None, use_emoji: bool) -> str:
         return txt
     return txt.split(" ", 1)[1] if " " in txt else txt
 
-# --------------------------------------------------------
-# stato app
-# --------------------------------------------------------
+# ---------------------- colori curses ----------------------
+def init_colors():
+    """Inizializza coppie di colori per linee e riempimenti."""
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    # linee
+    curses.init_pair(1, curses.COLOR_YELLOW, -1)  # temperatura
+    curses.init_pair(2, curses.COLOR_BLUE,   -1)  # precipitazioni
+    curses.init_pair(3, curses.COLOR_CYAN,   -1)  # umidità
+    # riempimenti (bg)
+    curses.init_pair(11, -1, curses.COLOR_YELLOW)
+    curses.init_pair(12, -1, curses.COLOR_BLUE)
+    curses.init_pair(13, -1, curses.COLOR_CYAN)
+
+LINE_TEMP, LINE_PREC, LINE_HUM = 1, 2, 3
+FILL_TEMP, FILL_PREC, FILL_HUM = 11, 12, 13
+
+# ---------------------- stato app ----------------------
 @dataclass
 class AppState:
     city_query: Optional[str] = None
@@ -92,9 +84,7 @@ class AppState:
     def clamp_hours(self) -> None:
         self.hours = max(6, min(168, self.hours))
 
-# --------------------------------------------------------
-# prompt input riga in curses (per cambiare città)
-# --------------------------------------------------------
+# ---------------------- input linea ----------------------
 def prompt_input_line(stdscr, prompt: str) -> Optional[str]:
     max_y, max_x = stdscr.getmaxyx()
     y = max_y - 1
@@ -117,9 +107,7 @@ def prompt_input_line(stdscr, prompt: str) -> Optional[str]:
                 buf.append(ch); stdscr.addstr(y, x, ch); x += 1
         stdscr.refresh()
 
-# --------------------------------------------------------
-# fetch dati
-# --------------------------------------------------------
+# ---------------------- fetch dati ----------------------
 def ensure_data(state: AppState) -> None:
     now = time.monotonic()
     if state.data is not None and (now - state.last_fetch_ts) < state.refetch_sec:
@@ -138,9 +126,7 @@ def ensure_data(state: AppState) -> None:
         state.city_label = loc.name
         state.last_fetch_ts = now
 
-# --------------------------------------------------------
-# header / pannelli sinistra+centro
-# --------------------------------------------------------
+# ---------------------- layout: header/pannelli ----------------------
 def draw_header(stdscr, state: AppState) -> int:
     max_y, max_x = stdscr.getmaxyx()
     line = f" meteocli-tui  ·  {state.city_label}  ·  {time.strftime('%Y-%m-%d %H:%M:%S')} "
@@ -195,36 +181,8 @@ def draw_forecast_table(stdscr, y0: int, x0: int, w: int, state: AppState) -> in
         stdscr.addstr(y, x0, line[:w]); y += 1
     return y
 
-# --------------------------------------------------------
-# GRAFICI: plotext integrato (funzione richiesta!)
-# --------------------------------------------------------
-def render_plotext_chart(width: int, height: int, title: str, xlabels: List[str], values: List[float], ylabel: str) -> List[str]:
-    """
-    Costruisce un grafico plotext e restituisce le righe di testo (lista di stringhe).
-    Catturo l'output di plt.show() su una StringIO.
-    """
-    import plotext as plt
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        try:
-            plt.clear_figure()
-            w = max(20, width - 2)
-            h = max(10, height - 2)
-            plt.plotsize(w, h)
-            plt.title(title)
-            plt.xlabel("Ora")
-            plt.ylabel(ylabel)
-            plt.plot(values)
-            if xlabels:
-                step = max(1, len(xlabels) // 10)
-                xs = list(range(0, len(xlabels), step))
-                plt.xticks(xs, [xlabels[i] for i in xs])
-            plt.show()
-        except Exception as e:
-            return [f"[plotext error] {e}"]
-    return [line[:width] for line in buf.getvalue().splitlines() if line.strip("\n") != ""]
+# ---------------------- grafici area colorati ----------------------
 def _sample_to_width(values: List[float], width: int) -> List[float]:
-    """Riduce/espande i dati a `width` punti, campionando in modo uniforme."""
     if not values:
         return []
     if len(values) == width:
@@ -243,92 +201,64 @@ def draw_area_chart(
     title: str, line_pair: int, fill_pair: int,
     label_every: int = 8
 ) -> None:
-    """
-    Disegna un grafico 'area' a colori:
-      - riempimento sotto la curva con background colorato (DIM),
-      - linea superiore colorata,
-      - valore numerico sopra alcuni punti,
-      - tick orari in basso (sparsi per non accavallarsi).
-    Coordinate: (x0,y0) in alto a sinistra; w larghezza, h altezza.
-    """
     if w < 10 or h < 6 or not values:
-        stdscr.addstr(y0, x0, "(spazio insufficiente)")  # fallback
+        stdscr.addstr(y0, x0, "(spazio insufficiente)")
         return
-
-    # titolo
     stdscr.addstr(y0, x0, title[:w])
     top = y0 + 1
-    height = h - 3                # - titolo (1) e riga ticks (1) + margine (1)
-    base_y = top + height - 1     # riga del "terreno"
-
-    # normalizzazione valori -> 0..height-1
+    height = h - 3
+    base_y = top + height - 1
     vs = values[:]
     vmin, vmax = min(vs), max(vs)
     if vmax == vmin:
         vmax = vmin + 1.0
     scale = (height - 1) / (vmax - vmin)
-
-    # campiona la serie sulla larghezza disponibile
     xs = list(range(w))
     ys = []
     sampled = _sample_to_width(vs, w)
     for v in sampled:
         y = base_y - int(round((v - vmin) * scale))
         ys.append(y)
-
-    # riempimento: colonne di spazi con background colorato
+    # riempimento
     for x, y_line in zip(xs, ys):
         for y in range(y_line + 1, base_y + 1):
             stdscr.addstr(y, x0 + x, " ", curses.color_pair(fill_pair) | curses.A_DIM)
-
-    # linea: carattere orizzontale; colleghiamo con leggera continuità
+    # linea
     for i, (x, y) in enumerate(zip(xs, ys)):
         stdscr.addstr(y, x0 + x, "─", curses.color_pair(line_pair) | curses.A_BOLD)
         if i > 0:
-            # collega al punto precedente se c'è gradino verticale
             y_prev = ys[i - 1]
             step = 1 if y > y_prev else -1
             for yy in range(y_prev, y, step):
                 stdscr.addstr(yy, x0 + x, "─", curses.color_pair(line_pair))
-
-    # label numeriche sopra la linea, ogni 'label_every' colonne
+    # etichette
     for i, (x, y) in enumerate(zip(xs, ys)):
         if i % max(1, label_every) == 0:
             lab = str(int(round(sampled[i])))
             yy = max(top, y - 1)
             xx = max(x0, min(x0 + w - len(lab), x0 + x - len(lab)//2))
             stdscr.addstr(yy, xx, lab, curses.color_pair(line_pair) | curses.A_BOLD)
-
-    # ticks in basso (xlabels diradate)
+    # tick orari
     stdscr.addstr(base_y + 1, x0, " " * w)
     if xlabels:
-        step = max(1, len(xlabels) // 8)  # ~8 etichette max
+        step = max(1, len(xlabels) // 8)
         for i in range(0, len(xlabels), step):
             col = int(round(i * (w - 1) / (len(xlabels) - 1))) if len(xlabels) > 1 else 0
-            label = xlabels[i][:5]  # "HH:MM"
+            label = xlabels[i][:5]
             xx = max(x0, min(x0 + w - len(label), x0 + col - len(label)//2))
             stdscr.addstr(base_y + 1, xx, label, curses.A_DIM)
 
-
 def draw_graphs(stdscr, y0: int, x0: int, w: int, hgt: int, state: AppState) -> None:
-    """
-    Pannello destro: DUE grafici 'area' colorati, oppure fallback sparkline se lo spazio è scarso.
-    - Modalità 'temp_prec': Temperatura (giallo) + Precipitazioni (blu)
-    - Modalità 'prec_hum' : Precipitazioni (blu) + Umidità (ciano)
-    """
     stdscr.addstr(y0, x0, "[ Grafici ]  (t: cambia modalità)")
     y = y0 + 1
     if not state.data:
         stdscr.addstr(y, x0, "Nessun dato."); return
-
     H = state.data.get("hourly", {})
     times = H.get("time", [])[:state.hours]
     xlabels = [t[11:16] if isinstance(t, str) and len(t) >= 16 else "" for t in times]
     temps = clean_floats(H.get("temperature_2m", [])[:state.hours])
     probs = clean_floats(H.get("precipitation_probability", [])[:state.hours])
     hums  = clean_floats(H.get("relative_humidity_2m", [])[:state.hours])
-
-    # se troppo stretto/basso → fallback compatto
     if w < 24 or hgt < 14:
         stdscr.addstr(y, x0, "(spazio ridotto → grafici compatti)")
         y += 1
@@ -337,10 +267,8 @@ def draw_graphs(stdscr, y0: int, x0: int, w: int, hgt: int, state: AppState) -> 
         stdscr.addstr(y, x0, "Prec %"); y += 1
         stdscr.addstr(y, x0, sparkline(probs, width=max(10, w-2), charset=state.spark_charset)); y += 1
         return
-
     half_h = (hgt - 1) // 2
     unit_t = "°C" if state.temp_unit == "c" else "°F"
-
     if state.graph_mode == "temp_prec":
         draw_area_chart(
             stdscr, x0=x0, y0=y, w=w, h=half_h,
@@ -370,9 +298,7 @@ def draw_graphs(stdscr, y0: int, x0: int, w: int, hgt: int, state: AppState) -> 
             line_pair=LINE_HUM, fill_pair=FILL_HUM, label_every=8
         )
 
-# --------------------------------------------------------
-# help overlay
-# --------------------------------------------------------
+# ---------------------- help overlay ----------------------
 def draw_help_overlay(stdscr) -> None:
     max_y, max_x = stdscr.getmaxyx()
     help_text = """
@@ -386,8 +312,6 @@ def draw_help_overlay(stdscr) -> None:
       t       — Cambia grafici (Temp+Prec ↔ Prec+Umidità)
       r       — Ridisegna subito
       ? / h   — Mostra/Nascondi aiuto
-
-    Note: grafici via plotext; se spazio insufficiente → sparkline compatte.
     """.strip("\n")
     box_w = min(86, max_x - 4)
     lines = []
@@ -402,9 +326,7 @@ def draw_help_overlay(stdscr) -> None:
     for line in lines[: box_h - 3]:
         stdscr.addstr(y, x0 + 2, line.ljust(box_w - 4)); y += 1
 
-# --------------------------------------------------------
-# main loop curses
-# --------------------------------------------------------
+# ---------------------- main loop curses ----------------------
 def run(stdscr, state: AppState) -> int:
     curses.curs_set(0); stdscr.nodelay(True)
     stdscr.timeout(state.refresh_sec * 1000); curses.use_default_colors()
@@ -414,20 +336,16 @@ def run(stdscr, state: AppState) -> int:
         ensure_data(state)
         stdscr.erase()
         y = draw_header(stdscr, state)
-
         max_y, max_x = stdscr.getmaxyx()
         col = max(24, max_x // 3)
         left_x, mid_x, right_x = 0, col + 1, (col * 2) + 2
         right_w = max_x - right_x - 1
         body_h = max_y - y - 1
-
         draw_current_panel(stdscr, y, left_x, col - 2, state)
         draw_forecast_table(stdscr, y, mid_x, col - 2, state)
         draw_graphs(stdscr, y, right_x, right_w, body_h, state)
-
         if show_help: draw_help_overlay(stdscr)
         stdscr.refresh()
-
         try:
             ch = stdscr.get_wch()
         except curses.error:
@@ -435,7 +353,6 @@ def run(stdscr, state: AppState) -> int:
         if ch is None:
             continue
         key = ch.lower() if isinstance(ch, str) else ch
-
         if key in ("q", "\x1b"): return 0
         elif key == "r": pass
         elif key == "u":
