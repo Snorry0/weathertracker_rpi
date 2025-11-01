@@ -10,7 +10,11 @@ TUI interattiva "alla htop" con GRAFICI colore (curses)
 import curses, time, textwrap
 from dataclasses import dataclass
 from typing import List, Optional
-
+EMOJI_VARIATION = "\ufe0f"   # Variation Selector-16
+ZWJ = "\u200d"               # Zero Width Joiner
+def strip_variants(s: str) -> str:
+    # rimuove selettori/zwj che a volte rompono il rendering in curses
+    return s.replace(ZWJ, "").replace(EMOJI_VARIATION, "")
 # riuso funzioni dal modulo CLI
 from .cli import ip_location, geocode_city, fetch_weather, describe_code
 
@@ -40,12 +44,23 @@ def sparkline(values: List[float], width: int = 40, charset: str = "blocks") -> 
 def clean_floats(seq):
     return [float(v) for v in seq if v is not None]
 
-def describe_for_tui(code: int | None, use_emoji: bool) -> str:
+def describe_for_tui(code: int | None, mode: str) -> str:
+    """
+    mode:
+      - "color": mostra emoji a colori (se il terminale le supporta)
+      - "bw":    prova con versione mono (senza variation selector)
+      - "off":   rimuovi emoji, lascia solo testo
+    """
     txt = describe_code(code)  # es: "🌧️ Pioggia"
-    if use_emoji:
+    parts = txt.split(" ", 1)  # ["🌧️", "Pioggia"]
+    if mode == "color":
         return txt
-    return txt.split(" ", 1)[1] if " " in txt else txt
-
+    if mode == "off":
+        return parts[1] if len(parts) > 1 else txt
+    # bw: tieni il simbolo ma senza varianti, così molti terminali lo rendono in b/n
+    if len(parts) > 1:
+        return strip_variants(parts[0]) + " " + parts[1]
+    return strip_variants(txt)
 # ---------------------- colori curses ----------------------
 def init_colors():
     """Inizializza coppie di colori per linee e riempimenti."""
@@ -68,6 +83,8 @@ FILL_TEMP, FILL_PREC, FILL_HUM = 11, 12, 13
 # ---------------------- stato app ----------------------
 @dataclass
 class AppState:
+    emoji_mode: str = "bw"       # "off" | "bw" | "color"
+    layout: str = "bottom"       # "bottom" | "side"
     city_query: Optional[str] = None
     city_label: str = "—"
     temp_unit: str = "c"         # "c" | "f"
@@ -133,7 +150,7 @@ def draw_header(stdscr, state: AppState) -> int:
     stdscr.addstr(0, 0, line[:max_x].ljust(max_x), curses.A_REVERSE)
     help_line = "[q] quit  [c] città  [g] geo-IP  [u] C/F  [w] vento  [+/-] ore  [t] grafici  [r] refresh  [?] help"
     stdscr.addstr(1, 0, help_line[:max_x].ljust(max_x))
-    status = f"emoji:{'on' if state.use_emoji else 'off'}  graph:{state.graph_mode}  hours:{state.hours}  wind:{state.wind_unit}"
+    status = f"emoji:{state.emoji_mode}  graph:{state.graph_mode}  layout:{state.layout}  hours:{state.hours}  wind:{state.wind_unit}"
     stdscr.addstr(2, 0, status[:max_x].ljust(max_x))
     return 3
 
@@ -152,7 +169,7 @@ def draw_current_panel(stdscr, y0: int, x0: int, w: int, state: AppState) -> int
     wc = safe_get(H.get("weather_code", []), 0)
     unit_t = "°C" if state.temp_unit == "c" else "°F"
     rows = [
-        ("Meteo",        describe_for_tui(wc, state.use_emoji)),
+        ("Meteo",        describe_for_tui(wc, state.emoji_mode)),
         ("Temperatura",  f"{t:.1f} {unit_t}" if t is not None else "—"),
         ("Umidità",      f"{int(rh)}%" if rh is not None else "—"),
         ("Prec. prob.",  f"{int(pp)}%" if pp is not None else "—"),
@@ -177,7 +194,7 @@ def draw_forecast_table(stdscr, y0: int, x0: int, w: int, state: AppState) -> in
         tstr = safe_get(times, i, "—")
         tval = safe_get(temps, i); pval = safe_get(probs, i); code = safe_get(codes, i)
         ora = tstr[11:16] if isinstance(tstr, str) and len(tstr) >= 16 else "—"
-        line = f"{ora:<5} {(f'{tval:.0f}{unit_t}' if tval is not None else '—'):<6} {(f'{int(pval)}%' if pval is not None else '—'):<6} {describe_for_tui(code, state.use_emoji)}"
+        line = f"{ora:<5} {(f'{tval:.0f}{unit_t}' if tval is not None else '—'):<6} {(f'{int(pval)}%' if pval is not None else '—'):<6} {describe_for_tui(code, state.emoji_mode)}"
         stdscr.addstr(y, x0, line[:w]); y += 1
     return y
 
@@ -337,13 +354,29 @@ def run(stdscr, state: AppState) -> int:
         stdscr.erase()
         y = draw_header(stdscr, state)
         max_y, max_x = stdscr.getmaxyx()
-        col = max(24, max_x // 3)
-        left_x, mid_x, right_x = 0, col + 1, (col * 2) + 2
-        right_w = max_x - right_x - 1
         body_h = max_y - y - 1
-        draw_current_panel(stdscr, y, left_x, col - 2, state)
-        draw_forecast_table(stdscr, y, mid_x, col - 2, state)
-        draw_graphs(stdscr, y, right_x, right_w, body_h, state)
+
+        if state.layout == "bottom":
+           # fascia alta: due pannelli affiancati (attuale + tabella)
+           top_h  = max(10, body_h // 2)              # metà schermo circa
+           left_w = min(40, max(28, max_x // 3))      # pannello attuale stretto
+           right_w = max_x - left_w - 2
+
+           draw_current_panel(stdscr, y,            0,        left_w - 1, state)
+           draw_forecast_table(stdscr, y, left_w + 2,        right_w - 1, state)
+
+           # fascia bassa: GRAFICI a tutta larghezza
+           draw_graphs(stdscr, y + top_h, 0, max_x - 1, body_h - top_h, state)
+        else:
+           # layout "side" (quello vecchio): grafici a destra
+            col = max(24, max_x // 3)
+            left_x, mid_x, right_x = 0, col + 1, (col * 2) + 2
+            right_w = max_x - right_x - 1
+
+            draw_current_panel(stdscr, y, left_x, col - 2, state)
+            draw_forecast_table(stdscr, y, mid_x,  col - 2, state)
+            draw_graphs(stdscr, y, right_x, right_w, body_h, state)
+
         if show_help: draw_help_overlay(stdscr)
         stdscr.refresh()
         try:
@@ -372,6 +405,12 @@ def run(stdscr, state: AppState) -> int:
             new_city = prompt_input_line(stdscr, "Nuova città (Enter=OK, ESC=annulla)")
             if new_city is not None:
                 state.city_query = new_city.strip() or None; state.last_fetch_ts = 0.0
+        elif key == "e":
+            order = ["off", "bw", "color"]
+            state.emoji_mode = order[(order.index(state.emoji_mode) + 1) % len(order)]
+        elif key == "o":
+            state.layout = "side" if state.layout == "bottom" else "bottom"
+
         elif key in ("?", "h"):
             show_help = not show_help
 

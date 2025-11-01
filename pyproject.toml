@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "meteocli"
-version = "0.2.2"
+version = "0.2.3"
 description = "CLI meteo per terminale (Raspberry/SSH) con grafici ASCII"
 readme = "README.md"
 authors = [{name = "Snorry0"}]
