@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import sys
 import argparse
 from dataclasses import dataclass
@@ -27,6 +28,36 @@ WEATHER_CODE: Dict[int, Tuple[str, str]] = {
 85: ("Rovesci di neve deboli", "🌨️"), 86: ("Rovesci di neve", "❄️"),
 95: ("Temporale", "⛈️"), 96: ("Temporale con grandine leggera", "⛈️"), 99: ("Temporale con grandine", "⛈️"),
 }
+
+# Simboli ASCII/BMP di fallback per terminali SSH senza font emoji
+_BW_SYMBOLS: Dict[int, str] = {
+    0: "[sole]",
+    1: "[soleggiato]", 2: "[nuvoloso]",
+    3: "[coperto]",
+    45: "[nebbia]", 48: "[nebbia]",
+    51: "[piovigg]", 53: "[piovigg]", 55: "[piovigg]",
+    56: "[gelato]",  57: "[gelato]",
+    61: "[pioggia]", 63: "[pioggia]", 65: "[pioggia]",
+    66: "[gelato]",  67: "[gelato]",
+    71: "[neve]", 73: "[neve]", 75: "[neve]", 77: "[neve]",
+    80: "[rovesci]", 81: "[rovesci]", 82: "[rovesci]",
+    85: "[neve]",  86: "[neve]",
+    95: "[tempora]", 96: "[tempora]", 99: "[tempora]",
+}
+
+def _detect_emoji_support() -> bool:
+    """Heuristica: SSH senza DISPLAY o LANG senza UTF-8 → emoji off."""
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"):
+        lang = os.environ.get("LANG", "") + os.environ.get("LC_ALL", "")
+        if "UTF" not in lang.upper():
+            return False
+        # Anche con UTF-8 via SSH molti terminali non hanno font emoji
+        # Lasciamo decidere all'utente via --no-emoji, default: tentiamo
+        return True
+    return True
+
+# Stato globale emoji (può essere sovrascritto dal flag CLI)
+_USE_EMOJI: bool = _detect_emoji_support()
 
 @dataclass
 class Location:
@@ -119,7 +150,10 @@ def describe_code(code: int | None) -> str:
     if code is None:
         return "—"
     desc, emoji = WEATHER_CODE.get(int(code), ("N/D", ""))
-    return f"{emoji} {desc}".strip()
+    if _USE_EMOJI:
+        return f"{emoji} {desc}".strip()
+    sym = _BW_SYMBOLS.get(int(code), "")
+    return f"{sym} {desc}".strip() if sym else desc
 
 def render_current(loc: Location, data: dict, temp_unit: str, wind_unit: str) -> None:
     h = data.get("hourly", {})
@@ -219,13 +253,17 @@ def parse_args(argv: List[str]):
     p.add_argument("--hours", "-H", type=int, default=48, help="Ore di previsione (max 168)")
     p.add_argument("--temp-unit", choices=["c", "f"], default="c", help="Unità temperatura")
     p.add_argument("--wind-unit", choices=["kmh", "ms", "mph", "kn"], default="mph", help="Unità vento")
+    p.add_argument("--no-emoji", action="store_true", help="Disabilita emoji (utile via SSH)")
     return p.parse_args(argv)
 
 
 
 
 def main(argv: List[str] | None = None) -> int:
+    global _USE_EMOJI
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.no_emoji:
+        _USE_EMOJI = False
     hours = max(1, min(168, args.hours))
 
 
